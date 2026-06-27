@@ -102,8 +102,8 @@ export default function Team() {
           </div>
         ) : (
           members.map((member) => {
-            const roleStyle = roleStyles[member.role];
-            const statusStyle = statusStyles[member.status];
+            const roleStyle = roleStyles[member.role as keyof typeof roleStyles] ?? roleStyles.staff;
+            const statusStyle = statusStyles[member.status as keyof typeof statusStyles] ?? statusStyles.active;
             return (
               <div
                 key={member.id}

@@ -140,7 +140,7 @@ export default function Settings() {
                 })}
                 <div className="pt-3">
                   <Button
-                    onClick={() => updateTenant.mutate({ businessHours: localHours ?? hours })}
+                    onClick={() => updateTenant.mutate({ business_hours: localHours ?? hours })}
                     disabled={updateTenant.isPending}
                     style={{ background: "var(--color-primary)", color: "var(--color-primary-foreground)" }}
                   >
@@ -220,8 +220,8 @@ export default function Settings() {
                 <div>
                   <label className="text-xs uppercase tracking-widest mb-1.5 block" style={{ color: "var(--color-muted-foreground)" }}>Twilio Number</label>
                   <input
-                    defaultValue={tenant?.twilioNumber ?? ""}
-                    onBlur={(e) => updateTenant.mutate({ twilioNumber: e.target.value })}
+                    defaultValue={(tenant as any)?.twilio_number ?? ""}
+                    onBlur={(e) => updateTenant.mutate({ twilio_number: e.target.value })}
                     placeholder="+12145550100"
                     className="w-full px-3 py-2 rounded-lg text-sm border max-w-xs"
                     style={{ background: "var(--color-muted)", border: "1px solid var(--color-border)", color: "var(--color-foreground)" }}

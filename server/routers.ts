@@ -2,31 +2,16 @@ import { COOKIE_NAME } from "@shared/const";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { protectedProcedure, publicProcedure, router } from "./_core/trpc";
-import { getDb } from "./db";
-import {
-  callLogs,
-  appointments,
-  knowledgeBase,
-  metrics,
-  teamMembers,
-  tenants,
-  services,
-  providers,
-} from "../drizzle/schema";
-import { eq, desc, and, sql } from "drizzle-orm";
 import { z } from "zod";
 import { TRPCError } from "@trpc/server";
+import { supabaseAdmin, DEMO_TENANT_ID } from "./supabase";
 
-// ─── Helper: get tenant for current user ─────────────────────────────────────
-async function getTenantId(userId: number): Promise<number> {
-  const db = await getDb();
-  if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "DB unavailable" });
-  // Use lowercase alias to avoid MySQL case-sensitivity issues
-  const rows = await db.execute(sql`SELECT tenantId as tid FROM users WHERE id = ${userId} LIMIT 1`);
-  const row = (rows as any)[0]?.[0];
-  // Fall back to tenant 1 (demo tenant) if user has no tenantId assigned yet
-  if (!row?.tid) return 1;
-  return row.tid as number;
+// ─── Helper: resolve tenant UUID for current user ─────────────────────────────
+// For now all authenticated users are scoped to the demo tenant.
+// When multi-tenant auth is wired, this will look up the user's tenant_id
+// from the users table in Supabase.
+function getTenantId(_userId: number): string {
+  return DEMO_TENANT_ID;
 }
 
 export const appRouter = router({
@@ -41,237 +26,303 @@ export const appRouter = router({
     }),
   }),
 
-  // ─── Metrics ─────────────────────────────────────────────────────────────
+  // ─── Metrics ───────────────────────────────────────────────────────────────
   metrics: router({
     getOverview: protectedProcedure.query(async ({ ctx }) => {
-      const tenantId = await getTenantId(ctx.user.id);
-      const db = await getDb();
-      if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
+      const tenantId = getTenantId(ctx.user.id);
 
-      const today = new Date().toISOString().split("T")[0];
-      const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString().split("T")[0];
-      const monthAgo = new Date(Date.now() - 30 * 86400000).toISOString().split("T")[0];
+      const today = new Date().toISOString().split("T")[0]!;
+      const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString().split("T")[0]!;
+      const monthAgo = new Date(Date.now() - 30 * 86400000).toISOString().split("T")[0]!;
 
-      const rows = await db
-        .select()
-        .from(metrics)
-        .where(eq(metrics.tenantId, tenantId))
-        .orderBy(desc(metrics.date))
+      const { data: rows, error } = await supabaseAdmin
+        .from("metrics")
+        .select("*")
+        .eq("tenant_id", tenantId)
+        .gte("date", monthAgo)
+        .order("date", { ascending: false })
         .limit(30);
 
-      const todayRow = rows.find((r) => r.date === today);
-      const weekRows = rows.filter((r) => r.date >= weekAgo);
-      const monthRows = rows.filter((r) => r.date >= monthAgo);
+      if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
 
-      const sum = (arr: typeof rows, key: keyof typeof rows[0]) =>
+      const allRows = rows ?? [];
+      const todayRow = allRows.find((r) => r.date === today);
+      const weekRows = allRows.filter((r) => r.date >= weekAgo);
+      const monthRows = allRows.filter((r) => r.date >= monthAgo);
+
+      const sum = (arr: typeof allRows, key: string) =>
         arr.reduce((acc, r) => acc + (Number(r[key]) || 0), 0);
 
       return {
         today: {
-          totalCalls: todayRow?.totalCalls ?? 0,
-          appointmentsBooked: todayRow?.appointmentsBooked ?? 0,
-          afterHoursCalls: todayRow?.afterHoursCalls ?? 0,
-          missedCallsPrevented: todayRow?.missedCallsPrevented ?? 0,
+          totalCalls: todayRow?.total_calls ?? 0,
+          appointmentsBooked: todayRow?.appointments_booked ?? 0,
+          afterHoursCalls: todayRow?.after_hours_calls ?? 0,
+          missedCallsPrevented: todayRow?.missed_calls_prevented ?? 0,
           escalations: todayRow?.escalations ?? 0,
         },
         week: {
-          totalCalls: sum(weekRows, "totalCalls"),
-          appointmentsBooked: sum(weekRows, "appointmentsBooked"),
+          totalCalls: sum(weekRows, "total_calls"),
+          appointmentsBooked: sum(weekRows, "appointments_booked"),
         },
         month: {
-          totalCalls: sum(monthRows, "totalCalls"),
-          appointmentsBooked: sum(monthRows, "appointmentsBooked"),
+          totalCalls: sum(monthRows, "total_calls"),
+          appointmentsBooked: sum(monthRows, "appointments_booked"),
         },
-        sparkline: rows.slice(0, 14).reverse().map((r) => ({
+        sparkline: [...allRows].reverse().slice(-14).map((r) => ({
           date: r.date,
-          calls: r.totalCalls,
-          booked: r.appointmentsBooked,
+          calls: r.total_calls,
+          booked: r.appointments_booked,
         })),
       };
     }),
   }),
 
-  // ─── Call Logs ───────────────────────────────────────────────────────────
+  // ─── Call Logs ─────────────────────────────────────────────────────────────
   callLogs: router({
     list: protectedProcedure
       .input(z.object({ limit: z.number().default(50), offset: z.number().default(0) }))
       .query(async ({ ctx, input }) => {
-        const tenantId = await getTenantId(ctx.user.id);
-        const db = await getDb();
-        if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-        return db
-          .select()
-          .from(callLogs)
-          .where(eq(callLogs.tenantId, tenantId))
-          .orderBy(desc(callLogs.callStart))
-          .limit(input.limit)
-          .offset(input.offset);
+        const tenantId = getTenantId(ctx.user.id);
+        const { data, error } = await supabaseAdmin
+          .from("call_logs")
+          .select("*")
+          .eq("tenant_id", tenantId)
+          .order("call_start", { ascending: false })
+          .range(input.offset, input.offset + input.limit - 1);
+
+        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
+        return data ?? [];
       }),
   }),
 
-  // ─── Appointments ─────────────────────────────────────────────────────────
+  // ─── Appointments ──────────────────────────────────────────────────────────
   appointments: router({
     list: protectedProcedure
-      .input(z.object({ status: z.enum(["booked", "rescheduled", "cancelled", "no_show", "all"]).default("all") }))
+      .input(
+        z.object({
+          status: z.enum(["booked", "rescheduled", "cancelled", "no_show", "all"]).default("all"),
+        })
+      )
       .query(async ({ ctx, input }) => {
-        const tenantId = await getTenantId(ctx.user.id);
-        const db = await getDb();
-        if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-        const query = db
-          .select()
-          .from(appointments)
-          .where(
-            input.status === "all"
-              ? eq(appointments.tenantId, tenantId)
-              : and(eq(appointments.tenantId, tenantId), eq(appointments.status, input.status))
-          )
-          .orderBy(desc(appointments.startTime));
-        return query;
+        const tenantId = getTenantId(ctx.user.id);
+
+        // Fetch appointments without join (services.id is text, no FK for PostgREST)
+        let query = supabaseAdmin
+          .from("appointments")
+          .select("*")
+          .eq("tenant_id", tenantId)
+          .order("start_time", { ascending: false });
+
+        if (input.status !== "all") {
+          query = query.eq("status", input.status);
+        }
+
+        const { data: appts, error } = await query;
+        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
+        if (!appts || appts.length === 0) return [];
+
+        // Enrich with service and provider names
+        const serviceIds = Array.from(new Set(appts.map((a) => a.service_id).filter(Boolean)));
+        const providerIds = Array.from(new Set(appts.map((a) => a.provider_id).filter(Boolean)));
+
+        const [{ data: services }, { data: providers }] = await Promise.all([
+          supabaseAdmin.from("services").select("id, name, category").in("id", serviceIds),
+          supabaseAdmin.from("providers").select("id, name").in("id", providerIds),
+        ]);
+
+        const svcMap = Object.fromEntries((services ?? []).map((s) => [s.id, s]));
+        const prvMap = Object.fromEntries((providers ?? []).map((p) => [p.id, p]));
+
+        return appts.map((a) => ({
+          ...a,
+          service: svcMap[a.service_id] ?? null,
+          provider: prvMap[a.provider_id] ?? null,
+        }));
       }),
   }),
 
-  // ─── Knowledge Base ───────────────────────────────────────────────────────
+  // ─── Knowledge Base ────────────────────────────────────────────────────────
   knowledge: router({
     list: protectedProcedure
-      .input(z.object({ type: z.enum(["faq", "policy", "medical", "document", "all"]).default("all") }))
+      .input(
+        z.object({
+          type: z.enum(["faq", "policy", "medical", "document", "all"]).default("all"),
+        })
+      )
       .query(async ({ ctx, input }) => {
-        const tenantId = await getTenantId(ctx.user.id);
-        const db = await getDb();
-        if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-        return db
-          .select()
-          .from(knowledgeBase)
-          .where(
-            input.type === "all"
-              ? eq(knowledgeBase.tenantId, tenantId)
-              : and(eq(knowledgeBase.tenantId, tenantId), eq(knowledgeBase.type, input.type))
-          )
-          .orderBy(desc(knowledgeBase.updatedAt));
+        const tenantId = getTenantId(ctx.user.id);
+        let query = supabaseAdmin
+          .from("knowledge_base")
+          .select("*")
+          .eq("tenant_id", tenantId)
+          .order("updated_at", { ascending: false });
+
+        if (input.type !== "all") {
+          query = query.eq("type", input.type);
+        }
+
+        const { data, error } = await query;
+        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
+        return data ?? [];
       }),
 
     upsert: protectedProcedure
-      .input(z.object({
-        id: z.number().optional(),
-        type: z.enum(["faq", "policy", "medical", "document"]),
-        question: z.string().optional(),
-        content: z.string(),
-      }))
+      .input(
+        z.object({
+          id: z.string().uuid().optional(),
+          type: z.enum(["faq", "policy", "medical", "document"]),
+          title: z.string().optional(),
+          content: z.string(),
+        })
+      )
       .mutation(async ({ ctx, input }) => {
-        const tenantId = await getTenantId(ctx.user.id);
-        const db = await getDb();
-        if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
+        const tenantId = getTenantId(ctx.user.id);
         if (input.id) {
-          await db.update(knowledgeBase)
-            .set({ question: input.question, content: input.content, embeddingStatus: "pending" })
-            .where(and(eq(knowledgeBase.id, input.id), eq(knowledgeBase.tenantId, tenantId)));
+          const { error } = await supabaseAdmin
+            .from("knowledge_base")
+            .update({ title: input.title, content: input.content, embedding_status: "pending", updated_at: new Date().toISOString() })
+            .eq("id", input.id)
+            .eq("tenant_id", tenantId);
+          if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
         } else {
-          await db.insert(knowledgeBase).values({
-            tenantId,
-            type: input.type,
-            question: input.question,
-            content: input.content,
-            embeddingStatus: "pending",
-          });
+          const { error } = await supabaseAdmin
+            .from("knowledge_base")
+            .insert({ tenant_id: tenantId, type: input.type, title: input.title, content: input.content, embedding_status: "pending" });
+          if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
         }
         return { success: true };
       }),
 
     delete: protectedProcedure
-      .input(z.object({ id: z.number() }))
+      .input(z.object({ id: z.string().uuid() }))
       .mutation(async ({ ctx, input }) => {
-        const tenantId = await getTenantId(ctx.user.id);
-        const db = await getDb();
-        if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-        await db.delete(knowledgeBase)
-          .where(and(eq(knowledgeBase.id, input.id), eq(knowledgeBase.tenantId, tenantId)));
+        const tenantId = getTenantId(ctx.user.id);
+        const { error } = await supabaseAdmin
+          .from("knowledge_base")
+          .delete()
+          .eq("id", input.id)
+          .eq("tenant_id", tenantId);
+        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
         return { success: true };
       }),
   }),
 
-  // ─── Settings ─────────────────────────────────────────────────────────────
+  // ─── Settings ──────────────────────────────────────────────────────────────
   settings: router({
     getTenant: protectedProcedure.query(async ({ ctx }) => {
-      const tenantId = await getTenantId(ctx.user.id);
-      const db = await getDb();
-      if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-      const rows = await db.select().from(tenants).where(eq(tenants.id, tenantId)).limit(1);
-      return rows[0] ?? null;
+      const tenantId = getTenantId(ctx.user.id);
+      const { data, error } = await supabaseAdmin
+        .from("tenants")
+        .select("*")
+        .eq("id", tenantId)
+        .single();
+      if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
+      return data;
     }),
 
     getServices: protectedProcedure.query(async ({ ctx }) => {
-      const tenantId = await getTenantId(ctx.user.id);
-      const db = await getDb();
-      if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-      return db.select().from(services).where(eq(services.tenantId, tenantId));
+      const tenantId = getTenantId(ctx.user.id);
+      const { data, error } = await supabaseAdmin
+        .from("services")
+        .select("*")
+        .eq("tenant_id", tenantId)
+        .order("category");
+      if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
+      return data ?? [];
     }),
 
     getProviders: protectedProcedure.query(async ({ ctx }) => {
-      const tenantId = await getTenantId(ctx.user.id);
-      const db = await getDb();
-      if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-      return db.select().from(providers).where(eq(providers.tenantId, tenantId));
+      const tenantId = getTenantId(ctx.user.id);
+      const { data, error } = await supabaseAdmin
+        .from("providers")
+        .select("*")
+        .eq("tenant_id", tenantId)
+        .order("name");
+      if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
+      return data ?? [];
     }),
 
     updateTenant: protectedProcedure
-      .input(z.object({
-        name: z.string().optional(),
-        phone: z.string().optional(),
-        address: z.string().optional(),
-        twilioNumber: z.string().optional(),
-        businessHours: z.any().optional(),
-      }))
+      .input(
+        z.object({
+          name: z.string().optional(),
+          phone: z.string().optional(),
+          address: z.string().optional(),
+          twilio_number: z.string().optional(),
+          business_hours: z.any().optional(),
+        })
+      )
       .mutation(async ({ ctx, input }) => {
-        const tenantId = await getTenantId(ctx.user.id);
-        const db = await getDb();
-        if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-        await db.update(tenants).set(input).where(eq(tenants.id, tenantId));
+        const tenantId = getTenantId(ctx.user.id);
+        const { error } = await supabaseAdmin
+          .from("tenants")
+          .update(input)
+          .eq("id", tenantId);
+        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
         return { success: true };
       }),
   }),
 
-  // ─── Team ─────────────────────────────────────────────────────────────────
+  // ─── Team ──────────────────────────────────────────────────────────────────
   team: router({
     list: protectedProcedure.query(async ({ ctx }) => {
-      const tenantId = await getTenantId(ctx.user.id);
-      const db = await getDb();
-      if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-      return db.select().from(teamMembers).where(eq(teamMembers.tenantId, tenantId)).orderBy(desc(teamMembers.invitedAt));
+      const tenantId = getTenantId(ctx.user.id);
+      const { data, error } = await supabaseAdmin
+        .from("team_members")
+        .select("*")
+        .eq("tenant_id", tenantId)
+        .order("invited_at", { ascending: false });
+      if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
+      return data ?? [];
     }),
 
     invite: protectedProcedure
-      .input(z.object({ email: z.string().email(), name: z.string().optional(), role: z.enum(["admin", "staff"]) }))
+      .input(
+        z.object({
+          email: z.string().email(),
+          name: z.string().optional(),
+          role: z.enum(["admin", "staff"]),
+        })
+      )
       .mutation(async ({ ctx, input }) => {
-        if (ctx.user.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
-        const tenantId = await getTenantId(ctx.user.id);
-        const db = await getDb();
-        if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-        await db.insert(teamMembers).values({ tenantId, email: input.email, name: input.name, role: input.role, status: "invited" });
+        if (ctx.user.role !== "admin")
+          throw new TRPCError({ code: "FORBIDDEN" });
+        const tenantId = getTenantId(ctx.user.id);
+        const { error } = await supabaseAdmin
+          .from("team_members")
+          .insert({ tenant_id: tenantId, email: input.email, name: input.name, role: input.role, status: "invited" });
+        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
         return { success: true };
       }),
 
     updateRole: protectedProcedure
-      .input(z.object({ memberId: z.number(), role: z.enum(["admin", "staff"]) }))
+      .input(z.object({ memberId: z.string().uuid(), role: z.enum(["admin", "staff"]) }))
       .mutation(async ({ ctx, input }) => {
-        if (ctx.user.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
-        const tenantId = await getTenantId(ctx.user.id);
-        const db = await getDb();
-        if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-        await db.update(teamMembers)
-          .set({ role: input.role })
-          .where(and(eq(teamMembers.id, input.memberId), eq(teamMembers.tenantId, tenantId)));
+        if (ctx.user.role !== "admin")
+          throw new TRPCError({ code: "FORBIDDEN" });
+        const tenantId = getTenantId(ctx.user.id);
+        const { error } = await supabaseAdmin
+          .from("team_members")
+          .update({ role: input.role })
+          .eq("id", input.memberId)
+          .eq("tenant_id", tenantId);
+        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
         return { success: true };
       }),
 
     revoke: protectedProcedure
-      .input(z.object({ memberId: z.number() }))
+      .input(z.object({ memberId: z.string().uuid() }))
       .mutation(async ({ ctx, input }) => {
-        if (ctx.user.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
-        const tenantId = await getTenantId(ctx.user.id);
-        const db = await getDb();
-        if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-        await db.update(teamMembers)
-          .set({ status: "revoked" })
-          .where(and(eq(teamMembers.id, input.memberId), eq(teamMembers.tenantId, tenantId)));
+        if (ctx.user.role !== "admin")
+          throw new TRPCError({ code: "FORBIDDEN" });
+        const tenantId = getTenantId(ctx.user.id);
+        const { error } = await supabaseAdmin
+          .from("team_members")
+          .update({ status: "revoked" })
+          .eq("id", input.memberId)
+          .eq("tenant_id", tenantId);
+        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
         return { success: true };
       }),
   }),

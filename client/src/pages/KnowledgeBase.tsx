@@ -32,7 +32,7 @@ const embeddingIcons = {
 
 export default function KnowledgeBase() {
   const [activeTab, setActiveTab] = useState<KBType>("all");
-  const [editEntry, setEditEntry] = useState<{ id?: number; type: "faq" | "policy" | "medical" | "document"; question: string; content: string } | null>(null);
+  const [editEntry, setEditEntry] = useState<{ id?: string; type: "faq" | "policy" | "medical" | "document"; question: string; content: string } | null>(null);
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const utils = trpc.useUtils();
 
@@ -63,9 +63,9 @@ export default function KnowledgeBase() {
 
   function openEdit(entry: typeof entries[0]) {
     setEditEntry({
-      id: entry.id,
-      type: entry.type,
-      question: entry.question ?? "",
+      id: typeof entry.id === 'string' ? entry.id : String(entry.id),
+      type: entry.type as "faq" | "policy" | "medical" | "document",
+      question: (entry as any).title ?? (entry as any).question ?? "",
       content: entry.content,
     });
     setIsDialogOpen(true);
@@ -76,7 +76,7 @@ export default function KnowledgeBase() {
     upsert.mutate({
       id: editEntry.id,
       type: editEntry.type,
-      question: editEntry.question || undefined,
+      title: editEntry.question || undefined,
       content: editEntry.content,
     });
   }
@@ -151,7 +151,7 @@ export default function KnowledgeBase() {
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {entries.map((entry) => {
             const style = typeStyles[entry.type] ?? typeStyles.faq;
-            const embeddingIcon = embeddingIcons[entry.embeddingStatus ?? "pending"];
+            const embeddingIcon = embeddingIcons[(entry.embedding_status ?? entry.embeddingStatus ?? "pending") as keyof typeof embeddingIcons] ?? embeddingIcons.pending;
             return (
               <div key={entry.id} className="nova-card p-5 flex flex-col gap-3 animate-slide-up group">
                 <div className="flex items-center justify-between">
